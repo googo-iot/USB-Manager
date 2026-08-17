@@ -5,7 +5,13 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .models import ScannedDevice, UsbRecord
+from .models import (
+    ASSET_NO_MAX,
+    ScannedDevice,
+    UsbRecord,
+    asset_no_sequence,
+    format_asset_no,
+)
 from .util import now_iso
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "usb_manager.db"
@@ -19,7 +25,6 @@ CREATE TABLE IF NOT EXISTS usb_devices (
     owner          TEXT NOT NULL DEFAULT '',
     department     TEXT NOT NULL DEFAULT '',
     purpose        TEXT NOT NULL DEFAULT '',
-    security_level TEXT NOT NULL DEFAULT '일반',
     status         TEXT NOT NULL DEFAULT '사용중',
     note           TEXT NOT NULL DEFAULT '',
     device_key     TEXT NOT NULL DEFAULT '',
@@ -39,6 +44,10 @@ CREATE INDEX IF NOT EXISTS idx_usb_volume_serial ON usb_devices (volume_serial);
 
 # UsbRecord에서 id를 뺀 컬럼 목록 (INSERT/UPDATE에 사용)
 _COLUMNS = [f.name for f in fields(UsbRecord) if f.name != "id"]
+_FIELD_NAMES = {f.name for f in fields(UsbRecord)}
+
+# 예전 버전에는 있었지만 지금은 쓰지 않는 컬럼
+_DROPPED_COLUMNS = ("security_level",)
 
 
 class DuplicateAssetNo(Exception):
@@ -56,7 +65,7 @@ class Database:
         self.conn.commit()
 
     def _migrate(self) -> None:
-        """예전 버전에서 만든 DB에 새로 생긴 컬럼을 채워 넣는다."""
+        """예전 버전에서 만든 DB의 스키마를 현재 모델에 맞춘다."""
         existing = {
             row["name"]
             for row in self.conn.execute("PRAGMA table_info(usb_devices)").fetchall()
@@ -66,6 +75,10 @@ class Database:
                 continue
             spec = "INTEGER" if column == "capacity_bytes" else "TEXT NOT NULL DEFAULT ''"
             self.conn.execute(f"ALTER TABLE usb_devices ADD COLUMN {column} {spec}")
+
+        for column in _DROPPED_COLUMNS:
+            if column in existing:
+                self.conn.execute(f"ALTER TABLE usb_devices DROP COLUMN {column}")
 
     def close(self) -> None:
         self.conn.close()
@@ -85,8 +98,9 @@ class Database:
         if keyword.strip():
             like = f"%{keyword.strip()}%"
             searchable = (
-                "asset_no", "label", "device_type", "owner", "department", "purpose",
-                "model", "serial_number", "volume_serial", "file_system", "note",
+                "asset_no", "label", "device_type", "owner", "department",
+                "purpose", "model", "serial_number", "volume_serial",
+                "file_system", "note",
             )
             clauses.append("(" + " OR ".join(f"{c} LIKE ?" for c in searchable) + ")")
             params.extend([like] * len(searchable))
@@ -115,17 +129,35 @@ class Database:
     def count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM usb_devices").fetchone()[0]
 
-    def next_asset_no(self, prefix: str = "USB-") -> str:
-        """USB-001 형식의 다음 관리번호를 제안한다."""
-        rows = self.conn.execute(
-            "SELECT asset_no FROM usb_devices WHERE asset_no LIKE ?", (f"{prefix}%",)
-        ).fetchall()
-        max_seq = 0
-        for (asset_no,) in rows:
-            tail = asset_no[len(prefix):]
-            if tail.isdigit():
-                max_seq = max(max_seq, int(tail))
-        return f"{prefix}{max_seq + 1:03d}"
+    def used_sequences(self) -> set[int]:
+        """이미 쓰이고 있는 관리번호의 숫자 부분."""
+        rows = self.conn.execute("SELECT asset_no FROM usb_devices").fetchall()
+        numbers = (asset_no_sequence(asset_no) for (asset_no,) in rows)
+        return {n for n in numbers if n is not None}
+
+    def next_asset_no(self) -> str:
+        """MS001 형식의 다음 관리번호를 제안한다.
+
+        쓰던 번호를 다시 쓰지 않도록 가장 큰 번호 다음을 고른다.
+        MS999까지 다 찼으면 빈 번호를 찾아 채운다.
+        """
+        used = self.used_sequences()
+        nxt = (max(used) + 1) if used else 1
+        if nxt > ASSET_NO_MAX:
+            gaps = set(range(1, ASSET_NO_MAX + 1)) - used
+            if not gaps:
+                return ""
+            nxt = min(gaps)
+        return format_asset_no(nxt)
+
+    def is_asset_no_taken(self, asset_no: str, exclude_id: Optional[int] = None) -> bool:
+        """이미 쓰이고 있는 관리번호인지. 수정 중인 자기 자신은 제외한다."""
+        sql = "SELECT 1 FROM usb_devices WHERE asset_no = ?"
+        params: list = [asset_no.strip()]
+        if exclude_id is not None:
+            sql += " AND id <> ?"
+            params.append(exclude_id)
+        return self.conn.execute(sql, params).fetchone() is not None
 
     # ------------------------------------------------------------------ 매칭
     def find_matching(self, device: ScannedDevice) -> Optional[UsbRecord]:
@@ -207,4 +239,5 @@ class Database:
     # ------------------------------------------------------------------ 내부
     @staticmethod
     def _to_record(row: sqlite3.Row) -> UsbRecord:
-        return UsbRecord(**{k: row[k] for k in row.keys()})
+        # 예전 DB에 남아 있는 모르는 컬럼은 무시한다.
+        return UsbRecord(**{k: row[k] for k in row.keys() if k in _FIELD_NAMES})

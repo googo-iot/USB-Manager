@@ -5,24 +5,41 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 # 관리 항목 선택지
-STATUS_CHOICES = ("사용중", "보관", "대여중", "분실", "폐기")
-SECURITY_CHOICES = ("일반", "대외비", "기밀")
-PURPOSE_SUGGESTIONS = ("업무용", "백업", "자료반출", "설치/부팅", "개인용", "기타")
-DEVICE_TYPE_CHOICES = ("USB메모리", "SD카드", "CF카드", "외장HDD/SSD", "기타")
+STATUS_CHOICES = ("사용중", "보관", "대여중", "폐기")
+PURPOSE_SUGGESTIONS = ("업무용", "백업", "자료반출", "개인용", "기타")
+DEVICE_TYPE_CHOICES = ("USB", "SD카드", "CF카드", "외장HDD/SSD", "기타")
 
-# 종류별 관리번호 접두어 (SD 카드는 SD-001 로 제안된다)
-ASSET_PREFIXES = {
-    "USB메모리": "USB-",
-    "SD카드": "SD-",
-    "CF카드": "CF-",
-    "외장HDD/SSD": "HDD-",
-    "기타": "ETC-",
-}
-DEFAULT_ASSET_PREFIX = "USB-"
+# 관리번호 규칙: MS + 숫자 3자리 (MS001 ~ MS999)
+ASSET_NO_PREFIX = "MS"
+ASSET_NO_DIGITS = 3
+ASSET_NO_MAX = 10 ** ASSET_NO_DIGITS - 1
+ASSET_NO_HINT = f"{ASSET_NO_PREFIX}001 형식 ({ASSET_NO_PREFIX} + 숫자 {ASSET_NO_DIGITS}자리)"
+
+ASSET_NO_RE = re.compile(rf"^{ASSET_NO_PREFIX}\d{{{ASSET_NO_DIGITS}}}$")
+# 입력 도중의 미완성 상태까지 허용하는 패턴 ('', 'M', 'MS', 'MS0', 'MS01', 'MS012')
+ASSET_NO_PARTIAL_RE = re.compile(rf"^(M(S(\d{{0,{ASSET_NO_DIGITS}}})?)?)?$")
 
 
-def asset_prefix(device_type: str) -> str:
-    return ASSET_PREFIXES.get(device_type, DEFAULT_ASSET_PREFIX)
+def is_valid_asset_no(value: str) -> bool:
+    """완성된 관리번호가 MS+숫자3자리 규칙에 맞는지."""
+    return bool(ASSET_NO_RE.match(value or ""))
+
+
+def is_partial_asset_no(value: str) -> bool:
+    """입력 중인 문자열이 규칙에 맞게 커나가고 있는지 (입력 제한용)."""
+    return bool(ASSET_NO_PARTIAL_RE.match(value or ""))
+
+
+def format_asset_no(number: int) -> str:
+    """1 -> 'MS001'"""
+    return f"{ASSET_NO_PREFIX}{number:0{ASSET_NO_DIGITS}d}"
+
+
+def asset_no_sequence(value: str) -> Optional[int]:
+    """'MS007' -> 7, 규칙에 맞지 않으면 None."""
+    if not is_valid_asset_no(value):
+        return None
+    return int(value[len(ASSET_NO_PREFIX):])
 
 # MSFT_PhysicalDisk.BusType 값
 BUS_USB = 7
@@ -69,7 +86,7 @@ def classify_device_type(
     if "FIXED" in (media_type or "").upper():  # 외장 케이스에 담긴 HDD/SSD
         return "외장HDD/SSD"
     if bus_type == BUS_USB or "REMOVABLE" in (media_type or "").upper():
-        return "USB메모리"
+        return "USB"
     return "기타"
 
 
@@ -79,13 +96,12 @@ class UsbRecord:
 
     id: Optional[int] = None
     # 사용자 입력 항목
-    asset_no: str = ""          # 관리번호
+    asset_no: str = ""          # 관리번호 (MS001 형식)
     label: str = ""             # 라벨/별칭
-    device_type: str = ""       # 종류 (USB메모리 / SD카드 등, 자동 판별 후 수정 가능)
+    device_type: str = ""       # 종류 (USB / SD카드 등, 자동 판별 후 수정 가능)
     owner: str = ""             # 담당자
     department: str = ""        # 부서
     purpose: str = ""           # 용도
-    security_level: str = "일반"  # 보안등급
     status: str = "사용중"        # 상태
     note: str = ""              # 비고
     # 장치에서 자동 수집한 항목

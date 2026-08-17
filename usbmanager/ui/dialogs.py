@@ -5,16 +5,23 @@ from tkinter import messagebox, ttk
 from typing import Callable, Optional
 
 from ..models import (
+    ASSET_NO_HINT,
     DEVICE_TYPE_CHOICES,
     PURPOSE_SUGGESTIONS,
-    SECURITY_CHOICES,
     STATUS_CHOICES,
     ScannedDevice,
     UsbRecord,
+    is_partial_asset_no,
+    is_valid_asset_no,
 )
 from ..util import format_bytes
 
 PAD = 8
+
+# 관리번호 입력 상태 표시 색
+OK_COLOR = "#1e7a34"
+WARN_COLOR = "#c0392b"
+HINT_COLOR = "#666666"
 
 
 class RecordDialog(tk.Toplevel):
@@ -29,11 +36,14 @@ class RecordDialog(tk.Toplevel):
         title: str,
         record: UsbRecord,
         device: Optional[ScannedDevice] = None,
+        is_asset_no_taken: Optional[Callable[[str], bool]] = None,
     ):
         super().__init__(parent)
         self.title(title)
         self.record = record
         self.device = device
+        # 자기 자신은 제외하고 중복 여부를 알려주는 콜백
+        self._is_taken = is_asset_no_taken or (lambda _no: False)
         self.result: Optional[UsbRecord] = None
 
         self.transient(parent)
@@ -43,12 +53,14 @@ class RecordDialog(tk.Toplevel):
             name: tk.StringVar(value=getattr(record, name))
             for name in (
                 "asset_no", "label", "device_type", "owner", "department",
-                "purpose", "security_level", "status",
+                "purpose", "status",
             )
         }
 
         self._build()
         self._populate_device_info()
+        self._vars["asset_no"].trace_add("write", lambda *_: self._refresh_asset_status())
+        self._refresh_asset_status()
 
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
         self.bind("<Escape>", lambda _e: self._on_cancel())
@@ -67,15 +79,14 @@ class RecordDialog(tk.Toplevel):
         form.columnconfigure(1, weight=1)
         form.columnconfigure(3, weight=1)
 
-        self._first_entry = self._add_entry(form, 0, 0, "관리번호 *", "asset_no")
+        self._add_asset_no_field(form, 0, 0)
         self._add_entry(form, 0, 2, "라벨/별칭 *", "label")
         # 종류는 연결된 장치에서 자동 판별하지만, 틀리면 직접 고칠 수 있게 둔다.
         self._add_combo(form, 1, 0, "종류", "device_type", DEVICE_TYPE_CHOICES)
         self._add_entry(form, 1, 2, "담당자", "owner")
         self._add_entry(form, 2, 0, "부서", "department")
         self._add_combo(form, 2, 2, "용도", "purpose", PURPOSE_SUGGESTIONS, readonly=False)
-        self._add_combo(form, 3, 0, "보안등급", "security_level", SECURITY_CHOICES)
-        self._add_combo(form, 3, 2, "상태", "status", STATUS_CHOICES)
+        self._add_combo(form, 3, 0, "상태", "status", STATUS_CHOICES)
 
         # --- 장치 정보 (자동 수집) --------------------------------------
         info = ttk.LabelFrame(outer, text="장치 정보 (자동 수집)", padding=PAD)
@@ -125,6 +136,49 @@ class RecordDialog(tk.Toplevel):
         buttons.pack(fill="x", pady=(PAD, 0))
         ttk.Button(buttons, text="취소", command=self._on_cancel).pack(side="right")
         ttk.Button(buttons, text="저장", command=self._on_save).pack(side="right", padx=(0, 6))
+
+    def _add_asset_no_field(self, parent: tk.Misc, row: int, col: int) -> None:
+        """관리번호 칸. 규칙에 맞지 않는 글자는 아예 입력되지 않는다."""
+        ttk.Label(parent, text="관리번호 *").grid(
+            row=row, column=col, sticky="w", padx=(0, 6), pady=4
+        )
+        box = ttk.Frame(parent)
+        box.grid(row=row, column=col + 1, sticky="ew", padx=(0, PAD), pady=4)
+
+        guard = (self.register(self._guard_asset_no), "%P")
+        self._first_entry = ttk.Entry(
+            box,
+            textvariable=self._vars["asset_no"],
+            width=9,
+            validate="key",
+            validatecommand=guard,
+        )
+        self._first_entry.pack(side="left")
+        self._asset_status = ttk.Label(box, text="", foreground=HINT_COLOR)
+        self._asset_status.pack(side="left", padx=(8, 0))
+
+    @staticmethod
+    def _guard_asset_no(proposed: str) -> bool:
+        """MS+숫자로 커나가는 문자열만 통과시킨다 (소문자는 이후 대문자로 바뀐다)."""
+        return is_partial_asset_no(proposed.upper())
+
+    def _refresh_asset_status(self) -> None:
+        """입력 중인 관리번호가 쓸 수 있는 번호인지 옆에 바로 알려준다."""
+        value = self._vars["asset_no"].get()
+        upper = value.upper()
+        if upper != value:  # 소문자로 쳐도 대문자로 맞춰준다
+            self._vars["asset_no"].set(upper)
+            return
+
+        if not upper:
+            text, color = "필수 입력", HINT_COLOR
+        elif not is_valid_asset_no(upper):
+            text, color = ASSET_NO_HINT, HINT_COLOR
+        elif self._is_taken(upper):
+            text, color = "이미 사용 중인 번호", WARN_COLOR
+        else:
+            text, color = "사용 가능", OK_COLOR
+        self._asset_status.config(text=text, foreground=color)
 
     def _add_entry(self, parent: tk.Misc, row: int, col: int, caption: str, key: str) -> ttk.Entry:
         ttk.Label(parent, text=caption).grid(row=row, column=col, sticky="w", padx=(0, 6), pady=4)
@@ -181,10 +235,25 @@ class RecordDialog(tk.Toplevel):
 
     # ------------------------------------------------------------------ 동작
     def _on_save(self) -> None:
-        asset_no = self._vars["asset_no"].get().strip()
+        asset_no = self._vars["asset_no"].get().strip().upper()
         label = self._vars["label"].get().strip()
-        if not asset_no:
-            messagebox.showwarning("입력 확인", "관리번호를 입력하세요.", parent=self)
+
+        if not is_valid_asset_no(asset_no):
+            messagebox.showwarning(
+                "관리번호 확인",
+                f"관리번호는 {ASSET_NO_HINT}로 입력하세요.\n예: MS001",
+                parent=self,
+            )
+            self._first_entry.focus_set()
+            return
+        if self._is_taken(asset_no):
+            messagebox.showwarning(
+                "중복 관리번호",
+                f"'{asset_no}'는 이미 등록된 관리번호입니다.\n다른 번호를 입력하세요.",
+                parent=self,
+            )
+            self._first_entry.focus_set()
+            self._first_entry.selection_range(0, "end")
             return
         if not label:
             messagebox.showwarning("입력 확인", "라벨/별칭을 입력하세요.", parent=self)
@@ -196,7 +265,6 @@ class RecordDialog(tk.Toplevel):
         record.owner = self._vars["owner"].get().strip()
         record.department = self._vars["department"].get().strip()
         record.purpose = self._vars["purpose"].get().strip()
-        record.security_level = self._vars["security_level"].get() or "일반"
         record.status = self._vars["status"].get() or "사용중"
         record.note = self._note.get("1.0", "end").strip()
 

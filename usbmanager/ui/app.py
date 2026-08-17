@@ -9,13 +9,7 @@ from typing import Optional
 
 from .. import APP_NAME, __version__
 from ..db import Database, DuplicateAssetNo
-from ..models import (
-    DEVICE_TYPE_CHOICES,
-    STATUS_CHOICES,
-    ScannedDevice,
-    UsbRecord,
-    asset_prefix,
-)
+from ..models import DEVICE_TYPE_CHOICES, STATUS_CHOICES, ScannedDevice, UsbRecord
 from ..scanner import ScanError, scan_devices
 from ..util import format_bytes, now_iso, short_date
 from .dialogs import DevicePickerDialog, RecordDialog, apply_device
@@ -32,7 +26,6 @@ COLUMNS = (
     ("owner", "담당자", 80, "w"),
     ("department", "부서", 90, "w"),
     ("purpose", "용도", 90, "w"),
-    ("security_level", "보안등급", 80, "center"),
     ("status", "상태", 70, "center"),
     ("model", "모델", 180, "w"),
     ("capacity", "용량", 80, "e"),
@@ -57,6 +50,8 @@ class UsbManagerApp(tk.Tk):
         self.last_scan_at: str = ""
 
         self._scan_queue: queue.Queue = queue.Queue()
+        self._poll_job: Optional[str] = None
+        self._auto_scan_job: Optional[str] = None
         self._scanning = False
         self._modal_open = False
         self._sort_column = "asset_no"
@@ -71,9 +66,10 @@ class UsbManagerApp(tk.Tk):
         self._build()
         self.refresh_list()
 
-        self.after(QUEUE_POLL_MS, self._poll_scan_queue)
+        # 창을 닫을 때 취소해야 하는 예약 작업들
+        self._poll_job = self.after(QUEUE_POLL_MS, self._poll_scan_queue)
         self.start_scan()
-        self.after(AUTO_SCAN_INTERVAL_MS, self._auto_scan_tick)
+        self._auto_scan_job = self.after(AUTO_SCAN_INTERVAL_MS, self._auto_scan_tick)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -148,7 +144,6 @@ class UsbManagerApp(tk.Tk):
         table.columnconfigure(0, weight=1)
 
         self.tree.tag_configure("connected", background="#e6f7e6")
-        self.tree.tag_configure("lost", foreground="#c0392b")
         self.tree.tag_configure("disposed", foreground="#999999")
 
         self.tree.bind("<Double-1>", lambda _e: self.edit_record())
@@ -185,9 +180,7 @@ class UsbManagerApp(tk.Tk):
             tags: list[str] = []
             if connected:
                 tags.append("connected")
-            if record.status == "분실":
-                tags.append("lost")
-            elif record.status == "폐기":
+            if record.status == "폐기":
                 tags.append("disposed")
 
             self.tree.insert(
@@ -202,7 +195,6 @@ class UsbManagerApp(tk.Tk):
                     record.owner,
                     record.department,
                     record.purpose,
-                    record.security_level,
                     record.status,
                     record.model,
                     format_bytes(record.capacity_bytes),
@@ -296,7 +288,7 @@ class UsbManagerApp(tk.Tk):
                     self._handle_scan_result(result)
         except queue.Empty:
             pass
-        self.after(QUEUE_POLL_MS, self._poll_scan_queue)
+        self._poll_job = self.after(QUEUE_POLL_MS, self._poll_scan_queue)
 
     def _handle_scan_result(self, devices: list[ScannedDevice], force_render: bool = False) -> None:
         self.connected = devices
@@ -320,7 +312,7 @@ class UsbManagerApp(tk.Tk):
     def _auto_scan_tick(self) -> None:
         if self._auto_scan_var.get() and not self._modal_open:
             self.start_scan()
-        self.after(AUTO_SCAN_INTERVAL_MS, self._auto_scan_tick)
+        self._auto_scan_job = self.after(AUTO_SCAN_INTERVAL_MS, self._auto_scan_tick)
 
     def _scan_now_blocking(self) -> list[ScannedDevice]:
         """대화창에서 '다시 스캔'을 눌렀을 때 쓰는 동기 스캔."""
@@ -358,17 +350,16 @@ class UsbManagerApp(tk.Tk):
             self._register_device(device)
 
     def _register_device(self, device: ScannedDevice) -> None:
-        # 종류에 맞는 접두어로 관리번호를 제안한다 (SD 카드면 SD-001).
         record = UsbRecord(
-            asset_no=self.db.next_asset_no(asset_prefix(device.device_type)),
+            asset_no=self.db.next_asset_no(),
             label=device.volume_label or device.model,
         )
         apply_device(record, device)
-        self._open_record_dialog("USB 등록", record, device=device, is_new=True)
+        self._open_record_dialog("장치 등록", record, device=device, is_new=True)
 
     def add_record(self) -> None:
         """장치 없이 직접 등록한다."""
-        record = UsbRecord(asset_no=self.db.next_asset_no(), device_type="USB메모리")
+        record = UsbRecord(asset_no=self.db.next_asset_no(), device_type="USB")
         self._open_record_dialog("등록 (직접 입력)", record, device=None, is_new=True)
 
     def edit_record(self) -> None:
@@ -392,7 +383,14 @@ class UsbManagerApp(tk.Tk):
     ) -> None:
         self._modal_open = True
         try:
-            dialog = RecordDialog(self, title, record, device=device)
+            dialog = RecordDialog(
+                self,
+                title,
+                record,
+                device=device,
+                # 수정 중인 자기 자신은 중복으로 보지 않는다.
+                is_asset_no_taken=lambda no: self.db.is_asset_no_taken(no, exclude_id=record.id),
+            )
             result = dialog.result
         finally:
             self._modal_open = False
@@ -493,7 +491,7 @@ class UsbManagerApp(tk.Tk):
             return
 
         headers = [
-            "관리번호", "종류", "라벨/별칭", "담당자", "부서", "용도", "보안등급", "상태",
+            "관리번호", "종류", "라벨/별칭", "담당자", "부서", "용도", "상태",
             "모델", "용량", "파일시스템", "시리얼번호", "볼륨 일련번호",
             "등록일", "최종수정일", "최종연결일", "비고",
         ]
@@ -505,7 +503,7 @@ class UsbManagerApp(tk.Tk):
                 for r in self.records:
                     writer.writerow([
                         r.asset_no, r.device_type, r.label, r.owner, r.department,
-                        r.purpose, r.security_level, r.status, r.model,
+                        r.purpose, r.status, r.model,
                         format_bytes(r.capacity_bytes), r.file_system,
                         r.serial_number, r.volume_serial,
                         r.registered_at, r.updated_at, r.last_seen_at, r.note,
@@ -517,5 +515,10 @@ class UsbManagerApp(tk.Tk):
         messagebox.showinfo("내보내기 완료", f"{len(self.records)}건을 저장했습니다.\n{path}", parent=self)
 
     def _on_close(self) -> None:
+        # 예약된 콜백을 먼저 취소해야 창이 사라진 뒤 실행되며 오류를 내지 않는다.
+        for job in (self._poll_job, self._auto_scan_job):
+            if job:
+                self.after_cancel(job)
+        self._poll_job = self._auto_scan_job = None
         self.db.close()
         self.destroy()
